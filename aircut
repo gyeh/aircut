@@ -1,0 +1,56 @@
+#!/bin/sh
+set -eu
+root=$(CDPATH='' cd "$(dirname "$0")" && pwd)
+service=local.aircut.server
+export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
+
+ready() {
+  curl -fs --max-time 2 -o /dev/null http://127.0.0.1:8765/api/state
+}
+
+case "${1:-run}" in
+  run)
+    if [ "$#" -gt 0 ]; then shift; fi
+    exec python3 "$root/aircut.py" "$@"
+    ;;
+  start)
+    if ! launchctl list "$service" >/dev/null 2>&1; then
+      umask 077
+      mkdir -p "$root/.aircut"
+      touch "$root/.aircut/server.log"
+      chmod 600 "$root/.aircut/server.log"
+      launchctl submit -l "$service" -o "$root/.aircut/server.log" -e "$root/.aircut/server.log" -- "$root/aircut" run
+    fi
+    attempts=0
+    until ready; do
+      attempts=$((attempts + 1))
+      if [ "$attempts" -ge 30 ]; then
+        echo "Aircut could not start. See .aircut/server.log." >&2
+        exit 1
+      fi
+      sleep 0.25
+    done
+    echo "Aircut is running at http://127.0.0.1:8765"
+    ;;
+  stop)
+    launchctl remove "$service"
+    echo "Stopped Aircut."
+    ;;
+  status)
+    if launchctl list "$service" >/dev/null 2>&1; then
+      if ready; then
+        echo "Aircut is running at http://127.0.0.1:8765"
+      else
+        echo "Aircut is registered but the dashboard is unavailable. Check .aircut/server.log."
+        exit 1
+      fi
+    else
+      echo "The Aircut background service is stopped."
+      exit 1
+    fi
+    ;;
+  *)
+    echo "Usage: ./aircut [run [server options] | start | stop | status]" >&2
+    exit 2
+    ;;
+esac

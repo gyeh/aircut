@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#242620">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <link rel="icon" href="/static/icon.png" type="image/png">
+  <link rel="apple-touch-icon" href="/static/icon.png">
+  <link rel="stylesheet" href="/static/style.css">
+  <title>Aircut — Listening room</title>
+  <script src="/static/app.js" defer></script>
+  <script src="/static/player.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="masthead"><div class="masthead-inner">
+    <a class="wordmark" href="#library" aria-label="Aircut home"><span class="signal" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>Aircut</a>
+    <nav aria-label="Main navigation"><a href="#library" id="nav-library">Library</a><a href="#saved" id="nav-saved" hidden>Saved</a><a href="#feeds" id="nav-feeds">Subscriptions</a></nav>
+    <button type="button" class="device-button" data-action="device"><span data-icon="phone"></span><span>iPhone access</span></button>
+  </div></header>
+  <main id="main" tabindex="-1"><p class="loading" role="status">Opening your library…</p></main>
+  <footer class="footer"><div><span class="status-light" id="server-light"></span><span id="server-label">Connecting</span></div><button type="button" data-action="server"><span data-icon="settings"></span> Server details</button></footer>
+  <section id="player" class="player" hidden aria-label="Audio player">
+    <div class="player-inner">
+      <div class="player-info"><span class="player-signal" data-icon="sound"></span><button type="button" id="player-title" data-action="show-playing"></button></div>
+      <div class="skip-controls" role="group" aria-label="Skip through episode">
+        <button type="button" class="skip-step" data-action="skip-back" aria-label="Skip back 15 seconds" disabled><span aria-hidden="true">↶</span><span id="skip-back-label">15s</span></button>
+        <button type="button" class="skip-step" data-action="skip-forward" aria-label="Skip forward 30 seconds" disabled><span aria-hidden="true">↷</span><span id="skip-forward-label">30s</span></button>
+      </div>
+      <audio id="audio" controls preload="metadata"></audio>
+      <div class="player-actions">
+        <button class="icon-button" type="button" data-action="player-settings" aria-label="Playback settings" title="Playback settings"><span data-icon="settings"></span></button>
+        <button class="icon-button" type="button" data-action="close-player" aria-label="Close player" title="Close player"><span data-icon="close"></span></button>
+      </div>
+    </div>
+  </section>
+  <dialog id="dialog" aria-labelledby="dialog-title"><div class="dialog-top"><span class="dialog-mark" id="dialog-mark"></span><button type="button" data-action="close-dialog" class="icon-button" aria-label="Close dialog"><span data-icon="close"></span></button></div><div id="dialog-body"></div></dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div><noscript>This listening room requires JavaScript. You can also subscribe to the server’s private RSS feed in Apple Podcasts.</noscript>
+</body>
+</html>
