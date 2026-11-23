@@ -16,6 +16,18 @@ import wave
 import podcast_processing as pipeline
 
 
+def decode_mono(path):
+    pcm = subprocess.check_output(["ffmpeg", "-v", "error", "-i", str(path),
+                                   "-ac", "1", "-ar", "16000", "-f", "s16le", "-"])
+    return [sample for sample, in struct.iter_unpack("<h", pcm)]
+
+
+def tone_amplitude(samples, hz):
+    angle = math.tau * hz / 16000
+    return 2 * math.hypot(sum(s * math.cos(i * angle) for i, s in enumerate(samples)),
+                          sum(s * math.sin(i * angle) for i, s in enumerate(samples))) / len(samples)
+
+
 class ProcessingTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("ffmpeg"), "requires FFmpeg")
     def test_recovers_missed_sponsor_and_editorial_speech_without_filling_silence(self):
@@ -64,6 +76,15 @@ class ProcessingTests(unittest.TestCase):
                 pipeline._detect_ads(segments, "Test", Path(folder), lambda stage: None)
             ads, _ = pipeline._detect_ads(segments, "Test", Path(folder), lambda stage: None)
             self.assertEqual(ads, [])
+
+    def test_close_cuts_chain_and_remove_intervening_speech_from_notes(self):
+        spans = [(0, 2), (2, 4), (4, 8), (8, 10), (10, 15), (15, 17), (17, 22.01), (22.01, 24)]
+        segments = [{"start": a, "end": b, "text": f"Line {i}"} for i, (a, b) in enumerate(spans)]
+        decision = {"ads": [{"first": i, "last": i, "reason": "Sponsor."} for i in (1, 3, 5, 7)]}
+        with tempfile.TemporaryDirectory() as folder, patch.object(pipeline, "_ask", return_value=decision):
+            ads, removed = pipeline._detect_ads(segments, "Test", Path(folder), lambda stage: None)
+        self.assertEqual([(ad["start"], ad["end"]) for ad in ads], [(2, 17), (22.01, 24)])
+        self.assertEqual(removed, {1, 2, 3, 4, 5, 7})
 
     def test_long_multilingual_episode_includes_last_section(self):
         sources = []
@@ -128,17 +149,49 @@ class ProcessingTests(unittest.TestCase):
             self.assertEqual(result, repeated)
             self.assertEqual(result["ads"][0]["start"], 1)
             self.assertIn("sponsor code", result["transcript"])
-            self.assertAlmostEqual(result["duration"], 2, delta=0.09)
+            expected_duration = 2 + pipeline.CHIME_SECONDS - 2 * pipeline.CROSSFADE_SECONDS
+            self.assertAlmostEqual(result["duration"], expected_duration, delta=0.06)
             self.assertAlmostEqual(result["original_duration"], 3, delta=0.01)
 
-            # Sample the middle of both surviving intervals, and measure their zero-crossing rates.
-            decoded = subprocess.check_output(["ffmpeg", "-v", "error", "-i", result["audio_path"],
-                                               "-ac", "1", "-ar", "16000", "-f", "s16le", "-"])
-            samples = [item[0] for item in struct.iter_unpack("<h", decoded)]
-            for offset, expected_hz in ((4000, rates[0]), (20000, rates[2])):
+            samples = decode_mono(result["audio_path"])
+            self.assertAlmostEqual(len(samples) / 16000, expected_duration, delta=0.001)
+            for offset, expected_hz in ((4000, rates[0]), (len(samples) - 12000, rates[2])):
                 sampleset = samples[offset:offset+8000]
                 crossings = sum(a < 0 <= b for a, b in zip(sampleset, sampleset[1:]))
                 self.assertAlmostEqual(crossings * 2, expected_hz, delta=6)
+            cue = samples[16400:18800]
+            chime = tone_amplitude(cue, 440)
+            self.assertGreater(chime, 200)
+            self.assertLess(chime, tone_amplitude(samples[4000:12000], rates[0]) / 2)
+            self.assertLess(tone_amplitude(cue, rates[1]), chime / 10)
+            self.assertLess(tone_amplitude(samples[21400:22200], 440), chime / 3)
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "requires FFmpeg")
+    def test_chimes_at_both_ends_and_between_quiet_and_loud_passages(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source, output = Path(folder) / "source.wav", Path(folder) / "edited.mp3"
+            with wave.open(str(source), "wb") as audio:
+                audio.setparams((1, 2, 16000, 0, "NONE", ""))
+                for hz, level in ((240, 1200), (1000, 12000)):
+                    audio.writeframes(b"".join(struct.pack("<h", round(level * math.sin(i * hz * math.tau / 16000)))
+                                               for i in range(112000)))
+            pipeline._render(source, output, [], source, 14)
+            original = decode_mono(output)
+            self.assertEqual(len(original), 224000)
+            self.assertLess(tone_amplitude(original[:16000], 440), 5)
+            ads = [{"start": a, "end": b} for a, b in [(0, .25), (.5, .75), (6.75, 7.25), (13.25, 14)]]
+            pipeline._render(source, output, ads, source, 14)
+            samples = decode_mono(output)
+
+        # The opening cuts absorb the quarter-second gap. Both six-second passages survive.
+        self.assertAlmostEqual(len(samples) / 16000, 13.34, delta=.001)
+        self.assertGreater(tone_amplitude(samples[12000:18000], 240), 800)
+        self.assertGreater(tone_amplitude(samples[114000:120000], 1000), 8000)
+        quiet, middle, loud = (tone_amplitude(samples[i:i+1600], 440) for i in (800, 104000, 206560))
+        self.assertGreater(quiet, 100)
+        self.assertGreater(min(middle, loud), quiet * 2)
+        self.assertLess(max(map(abs, samples[:40])), quiet / 8)
+        self.assertLess(max(map(abs, samples[-40:])), quiet / 8)
 
 
 if __name__ == "__main__":

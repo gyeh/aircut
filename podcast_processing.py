@@ -2,6 +2,7 @@
 
 import atexit
 from array import array
+from bisect import bisect_left
 from contextvars import ContextVar
 import hashlib
 import json
@@ -26,6 +27,10 @@ GAP_SECONDS = 8
 GAP_WINDOW_SECONDS = 45
 MAX_DOWNLOAD = 1024 ** 3
 MAX_TEXT_BYTES = 120_000
+RENDER_RATE = 44_100
+AD_MERGE_GAP_SECONDS = 5
+CHIME_SECONDS = 0.48
+CROSSFADE_SECONDS = 0.025
 _heartbeat = ContextVar("podcast_progress_check", default=None)
 _children = set()
 _children_lock = threading.Lock()
@@ -438,6 +443,23 @@ def _ad_blocks(segments):
     yield first, len(segments) - 1
 
 
+def _merge_ad_breaks(ads):
+    """Include intervening audio when successive cuts are at most five seconds apart."""
+    merged = []
+    for ad in sorted(ads, key=lambda item: item["start"]):
+        if ad["end"] <= ad["start"]:
+            continue
+        # Compare on the audio sample timeline so floating-point noise at five seconds is harmless.
+        if merged:
+            previous = merged[-1]
+            gap = round(ad["start"] * RENDER_RATE) - round(previous["end"] * RENDER_RATE)
+            if gap <= AD_MERGE_GAP_SECONDS * RENDER_RATE:
+                previous["end"] = max(previous["end"], ad["end"])
+                continue
+        merged.append(dict(ad))
+    return merged
+
+
 def _detect_ads(segments, title, cache, progress):
     marks = {}
     checkpoints = []
@@ -464,21 +486,17 @@ def _detect_ads(segments, title, cache, progress):
         for item in _model_result(cache, AD_TASK, source, AD_SCHEMA, validate, checkpoints):
             for i in range(item["first"], item["last"]+1):
                 marks[i] = item["reason"].strip()
-    if len(marks) == len(segments):
+    ads = _merge_ad_breaks({"start": segments[i]["start"], "end": segments[i]["end"], "reason": reason}
+                           for i, reason in marks.items())
+    # Notes use the same edit as the audio, including speech inside a bridged gap.
+    starts = [row["start"] for row in segments]
+    removed = {i for ad in ads for i in range(bisect_left(starts, ad["start"]), bisect_left(starts, ad["end"]))}
+    if len(removed) == len(segments):
         # Retain the transcript but allow a fresh classification on a user-initiated retry.
         for path in checkpoints:
             path.unlink(missing_ok=True)
-        raise RuntimeError("Every spoken segment was classified as advertising. The original audio has been preserved.")
-    ads = []
-    previous = -2
-    for index in sorted(marks):
-        row = segments[index]
-        if index == previous + 1 and row["start"] - ads[-1]["end"] < 3:
-            ads[-1]["end"] = row["end"]
-        else:
-            ads.append({"start": row["start"], "end": row["end"], "reason": marks[index]})
-        previous = index
-    return ads, marks
+        raise RuntimeError("Every spoken segment falls within the planned ad cuts. The original audio has been preserved.")
+    return ads, removed
 
 
 def _editor_text(cache, task, title, source):
@@ -518,16 +536,80 @@ def _summary_source(lines, title, cache, progress):
     return material
 
 
-def _render(source, output, ads):
-    options = []
+def _nearby_level(speech, start, end):
+    # The cached speech track has a sample-accurate timeline even for VBR downloads.
+    pcm = _run(["ffmpeg", "-nostdin", "-v", "error", *INPUT_OPTIONS, "-ss", f"{start:.8f}", "-i", str(speech),
+                "-t", f"{end - start:.8f}", "-ac", "1", "-ar", "16000", "-f", "s16le", "-"],
+               "Measuring audio beside an ad break")
+    samples = array("h", pcm)
+    return math.sqrt(sum(s * s for s in samples) / len(samples)) / 32768 if samples else 0
+
+
+def _chime_graph(ads, speech, duration):
+    # Work in decoded samples. Each contiguous ad break gets one cue.
+    total = round(duration * RENDER_RATE)
+    spans = []
+    cursor = 0
+    for ad in _merge_ad_breaks(ads):
+        start = max(0, round(ad["start"] * RENDER_RATE))
+        end = min(total, round(ad["end"] * RENDER_RATE))
+        if end <= max(start, cursor):
+            continue
+        if start > cursor:
+            spans.append((cursor, start, False))
+        spans.append((start, end, True))
+        cursor = end
+    if cursor < total:
+        spans.append((cursor, total, False))
+
+    kept = [f"[span{i}]" for i, (_, _, is_ad) in enumerate(spans) if not is_ad]
+    graph = []
+    if kept:
+        graph.append(f"[0:a:0]aresample={RENDER_RATE},aformat=channel_layouts=stereo,"
+                     f"asplit={len(kept)}" + "".join(kept))
+    lengths = []
+    for i, (start, end, is_ad) in enumerate(spans):
+        if not is_ad:
+            trim = f"atrim=start_sample={start}"
+            if i + 1 < len(spans):
+                trim += f":end_sample={end}"
+            graph.append(f"[span{i}]{trim},asetpts=N/SR/TB[part{i}]")
+            lengths.append(end - start)
+            continue
+        levels = []
+        if i:
+            left = max(spans[i - 1][0] / RENDER_RATE, start / RENDER_RATE - 0.65)
+            levels.append(_nearby_level(speech, left, start / RENDER_RATE))
+        if i + 1 < len(spans):
+            right = min(spans[i + 1][1] / RENDER_RATE, end / RENDER_RATE + 0.65)
+            levels.append(_nearby_level(speech, end / RENDER_RATE, right))
+        gain = min(0.075, max(0.009, 0.55 * max(levels, default=0)))
+        # A rounded A4 with a quieter open fifth and a quickly decaying octave.
+        tone = (f"{gain:.6f}*exp(-6*t)*(sin(2*PI*440*t)+0.32*exp(-3*t)*sin(2*PI*660*t)"
+                "+0.12*exp(-8*t)*sin(2*PI*880*t))")
+        graph.append(f"aevalsrc='{tone}':s={RENDER_RATE}:d={CHIME_SECONDS},"
+                     f"afade=t=in:d=0.028:curve=hsin,afade=t=out:st={CHIME_SECONDS-0.1}:d=0.1:curve=hsin,"
+                     f"pan=stereo|c0=c0|c1=c0[part{i}]")
+        lengths.append(round(CHIME_SECONDS * RENDER_RATE))
+
+    # Keep the overlap within the available material at each edge.
+    joined = "[part0]"
+    for i in range(1, len(spans)):
+        overlap = min(round(CROSSFADE_SECONDS * RENDER_RATE), lengths[i - 1] // 2, lengths[i] // 2)
+        transition = f"acrossfade=ns={overlap}:c1=hsin:c2=hsin" if overlap else "concat=n=2:v=0:a=1"
+        graph.append(f"{joined}[part{i}]{transition}[join{i}]")
+        joined = f"[join{i}]"
+    return ";".join(graph), joined
+
+
+def _render(source, output, ads, speech, duration):
+    options = ["-map", "0:a:0"]
     if ads:
-        cuts = "+".join(f"gte(t,{ad['start']:.6f})*lt(t,{ad['end']:.6f})" for ad in ads)
-        # Split into 10 ms frames before dropping intervals, then rebuild continuous timestamps.
-        filters = f"aresample=44100,asetpts=N/SR/TB,asetnsamples=n=441:p=0,aselect='not({cuts})',asetpts=N/SR/TB"
-        options = ["-af", filters]
+        graph, track = _chime_graph(ads, speech, duration)
+        options = ["-filter_complex", graph, "-map", track]
     tmp = output.with_suffix(".partial.mp3")
-    _run(["ffmpeg", "-nostdin", "-v", "error", "-y", *INPUT_OPTIONS, "-i", str(source), "-map", "0:a:0",
-          "-map_metadata", "-1", "-map_chapters", "-1", *options, "-ac", "2", "-ar", "44100",
+    _run(["ffmpeg", "-nostdin", "-v", "error", "-y", *INPUT_OPTIONS, "-i", str(source),
+          "-map_metadata", "-1", "-map_chapters", "-1", *options, "-ac", "2", "-ar", str(RENDER_RATE),
           "-c:a", "libmp3lame", "-q:a", "4", str(tmp)], "Ad-free audio rendering")
     duration = _duration(tmp)
     tmp.replace(output)
@@ -573,8 +655,8 @@ def _process(audio_url, episode_dir: Path, title: str, progress):
     speech = _prepare_speech_audio(source, cache)
     duration = _duration(speech)
     segments = _segments(speech, duration, cache, progress)
-    ads, marks = _detect_ads(segments, title, cache, progress)
-    material = _summary_source([row["text"] for i, row in enumerate(segments) if i not in marks],
+    ads, removed = _detect_ads(segments, title, cache, progress)
+    material = _summary_source([row["text"] for i, row in enumerate(segments) if i not in removed],
                                title, cache, progress)
     progress("Writing concise takeaways")
     takeaways = _editor_text(cache, TAKEAWAYS, title, material)
@@ -582,7 +664,7 @@ def _process(audio_url, episode_dir: Path, title: str, progress):
     summary = _editor_text(cache, SUMMARY, title, material)
     progress("Rendering cleaned audio")
     output = episode_dir / "episode.mp3"
-    clean_duration = _render(source, output, ads)
+    clean_duration = _render(source, output, ads, speech, duration)
     transcript = "\n".join(f"[{_timestamp(row['start'])}] {row['text']}" for row in segments)
     return {"audio_path": str(output), "duration": clean_duration, "original_duration": duration,
             "ads": ads, "transcript": transcript, "takeaways": takeaways, "summary": summary}
