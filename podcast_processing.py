@@ -2,7 +2,7 @@
 
 import atexit
 from array import array
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from contextvars import ContextVar
 import hashlib
 import json
@@ -53,6 +53,16 @@ AD_TASK = ("Identify clear advertisements, sponsor messages, or host-read ad cop
            "interviews, news about companies, show introductions, and mixed or uncertain boundary lines. "
            "Do not infer ads from a brand name alone. Include a short evidence-based reason for each "
            "range. If there are no clear ads, return an empty array.")
+BLOOMBERG_MINUTE_TASK = (" A Bloomberg Minute inserted into another program (such as the Tech or "
+                         "Market Minute) is an ad. Include the entire bulletin, its sponsor credits "
+                         "and call to action, even when the report sounds like ordinary news. Keep "
+                         "the surrounding program and any editorial mentions of the Minute.")
+_MINUTE_MARKER = re.compile(
+    r"\b(?:(?P<opening>this is)|that['’]s|that (?:is|was)|this (?:was|has been))\s+"
+    r"(?:the\s+)?bloomberg\s+(?:(?P<edition>[a-z]+)\s+)?minute\b", re.I)
+_MINUTE_CTA = re.compile(r"get started at (?:[\w-]+ ){0,2}[\w.-]+\.\w+", re.I)
+_MINUTE_CREDIT = re.compile(r"(?:brought to you by|sponsored by|presented by) [\w ,&'’-]+"
+                            rf"(?:[.!]?\s+{_MINUTE_CTA.pattern})?", re.I)
 TAKEAWAYS = ("Write the main takeaways in the transcript's primary language. Return plain text, "
              "one short bullet per takeaway, generally 3–5 bullets. Lead with specific claims or "
              "decisions; avoid generic descriptions of what was discussed.")
@@ -455,13 +465,61 @@ def _merge_ad_breaks(ads):
             gap = round(ad["start"] * RENDER_RATE) - round(previous["end"] * RENDER_RATE)
             if gap <= AD_MERGE_GAP_SECONDS * RENDER_RATE:
                 previous["end"] = max(previous["end"], ad["end"])
+                reason = ad.get("reason")
+                if reason and reason not in previous.get("reason", ""):
+                    previous["reason"] = (previous.get("reason", "") + " " + reason).strip()
                 continue
         merged.append(dict(ad))
     return merged
 
 
+def _bloomberg_minute_breaks(segments):
+    # Match bookends across transcription lines and model decision blocks. A single
+    # mention can't establish how much audio belongs to a bulletin.
+    lines = [row["text"] for row in segments]
+    text = "\n".join(lines)
+    offsets = []
+    pos = 0
+    for line in lines:
+        offsets.append(pos)
+        pos += len(line) + 1
+    opening = None
+    for marker in _MINUTE_MARKER.finditer(text):
+        first = bisect_right(offsets, marker.start()) - 1
+        last = bisect_right(offsets, marker.end() - 1) - 1
+        edition = (marker["edition"] or "").casefold()
+        if marker["opening"]:
+            # A mixed opening line may contain the end of the interview.
+            if re.search(r"\w", text[offsets[first]:marker.start()]):
+                first += 1
+            opening = first, edition
+            continue
+        if opening is None:
+            continue
+        start, expected = opening
+        opening = None
+        if edition != expected or start > last or segments[last]["end"] - segments[start]["start"] > 120:
+            continue
+        # Preserve a mixed closing line for the normal ad classifier. A sponsor
+        # credit alone can safely be included with the sign-off.
+        tail = text[marker.end():offsets[last] + len(lines[last])].strip(" ,.:;!?–—-")
+        if tail and not (_MINUTE_CREDIT.fullmatch(tail) or _MINUTE_CTA.fullmatch(tail)):
+            last -= 1
+        else:
+            for suffix in (_MINUTE_CREDIT, _MINUTE_CTA):
+                following = last + 1
+                if (following < len(lines) and segments[following]["start"] - segments[last]["end"] <= 2
+                        and suffix.fullmatch(lines[following].strip(" ,.!?"))):
+                    last = following
+        if start <= last:
+            name = " ".join(word for word in ("Bloomberg", edition.title(), "Minute") if word)
+            yield {"start": segments[start]["start"], "end": segments[last]["end"],
+                   "reason": f"The {name} opening and sign-off identify an inserted bulletin."}
+
+
 def _detect_ads(segments, title, cache, progress):
     marks = {}
+    bulletins = list(_bloomberg_minute_breaks(segments))
     checkpoints = []
     blocks = list(_ad_blocks(segments))
     for number, (first, last) in enumerate(blocks, 1):
@@ -483,11 +541,14 @@ def _detect_ads(segments, title, cache, progress):
                     raise RuntimeError("The model selected invalid transcript boundaries. Retry the episode.")
             return ranges
 
-        for item in _model_result(cache, AD_TASK, source, AD_SCHEMA, validate, checkpoints):
+        task = AD_TASK
+        if re.search(r"\bbloomberg\s+(?:[a-z]+\s+)?minute\b", " ".join(line for _, line in lines), re.I):
+            task += BLOOMBERG_MINUTE_TASK
+        for item in _model_result(cache, task, source, AD_SCHEMA, validate, checkpoints):
             for i in range(item["first"], item["last"]+1):
                 marks[i] = item["reason"].strip()
-    ads = _merge_ad_breaks({"start": segments[i]["start"], "end": segments[i]["end"], "reason": reason}
-                           for i, reason in marks.items())
+    ads = _merge_ad_breaks(bulletins + [{"start": segments[i]["start"], "end": segments[i]["end"], "reason": reason}
+                                        for i, reason in marks.items()])
     # Notes use the same edit as the audio, including speech inside a bridged gap.
     starts = [row["start"] for row in segments]
     removed = {i for ad in ads for i in range(bisect_left(starts, ad["start"]), bisect_left(starts, ad["end"]))}

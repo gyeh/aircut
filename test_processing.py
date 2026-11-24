@@ -29,6 +29,38 @@ def tone_amplitude(samples, hz):
 
 
 class ProcessingTests(unittest.TestCase):
+    def test_bloomberg_minute_crosses_model_blocks_and_transcript_lines(self):
+        lines = ["Interview continues."] * 176 + [
+            "This is the Bloomberg", "Market Minute, brought to you by our sponsor.",
+            "Markets opened higher.", "The rally lasted into the afternoon.",
+            "That was the Bloomberg Market", "Minute, brought to you by our sponsor.",
+            "Back to the interview.", "We discussed the Bloomberg Market Minute yesterday.",
+        ]
+        rows = [{"start": i * 4, "end": i * 4 + 3, "text": line} for i, line in enumerate(lines)]
+        # Even when the model returns no ads, the paired announcements enclose the entire report.
+        with tempfile.TemporaryDirectory() as folder, patch.object(pipeline, "_ask", return_value={"ads": []}) as ask:
+            ads, removed = pipeline._detect_ads(rows, "Example show", Path(folder), lambda stage: None)
+        self.assertEqual([(ad["start"], ad["end"]) for ad in ads], [(704, 727)])
+        self.assertEqual(removed, set(range(176, 182)))
+        self.assertTrue(all(pipeline.BLOOMBERG_MINUTE_TASK in call.args[0] for call in ask.call_args_list))
+
+    def test_minute_bookends_preserve_mixed_lines_and_require_a_nearby_matching_signoff(self):
+        def cuts(lines, stride=4):
+            rows = [{"start": i * stride, "end": i * stride + 3, "text": line} for i, line in enumerate(lines)]
+            return [(ad["start"], ad["end"]) for ad in pipeline._bloomberg_minute_breaks(rows)]
+
+        self.assertEqual(cuts(["A guest finishes. This is the Bloomberg Tech Minute.", "A news brief.",
+                               "That's the Bloomberg Tech Minute. Back to our guest."]), [(4, 7)])
+        self.assertEqual(cuts(["This is the Bloomberg Tech Minute.", "A news brief.",
+                               "That's the Bloomberg Tech Minute brought to you by Acme. Get started at acme.com.",
+                               "Back to our guest."]), [(0, 11)])
+        self.assertEqual(cuts(["This is the Bloomberg Market Minute.", "A news brief.", "That was the Bloomberg",
+                               "Market Minute,", "brought to you by Acme.", "Get started at acme.com.",
+                               "Back to our guest."]), [(0, 23)])
+        self.assertEqual(cuts(["This is the Bloomberg Minute.", "An unrelated discussion."]), [])
+        self.assertEqual(cuts(["This is the Bloomberg Tech Minute.", "That was the Bloomberg Market Minute."]), [])
+        self.assertEqual(cuts(["This is the Bloomberg Minute.", "That was the Bloomberg Minute."], stride=180), [])
+
     @unittest.skipUnless(shutil.which("ffmpeg"), "requires FFmpeg")
     def test_recovers_missed_sponsor_and_editorial_speech_without_filling_silence(self):
         first = {"start": 9, "end": 12, "text": "First."}
