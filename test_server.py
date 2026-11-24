@@ -90,6 +90,24 @@ class ServerTest(unittest.TestCase):
         stat, headers, _ = self.req(self.gateway, path, headers={"Range":"bytes=500-"})
         self.assertEqual((stat, headers["Content-Range"]), (416,"bytes */256"))
 
+    def test_original_is_replaced_in_same_feed_item(self):
+        feed = f"/private/{self.access.token('feed')}/feed.xml"
+        for status in ("queued", "processing", "failed", "ready"):
+            with self.library._db(write=True) as con:
+                con.execute("UPDATE episodes SET status=? WHERE id=1", (status,))
+            item, = ET.fromstring(self.req(self.gateway, feed)[2]).findall("channel/item")
+            identity = item.findtext("guid"), item.findtext("pubDate")
+            if status == "queued":
+                original_identity = identity
+            self.assertEqual(identity, original_identity)
+            if status == "ready":
+                self.assertEqual(item.findtext("title"), "A & B")
+                self.assertEqual(urlsplit(item.find("enclosure").get("url")).path, "/audio/1.mp3")
+            else:
+                self.assertIn("Original with ads", item.findtext("title"))
+                self.assertIn("Ads have not been removed", item.findtext("description"))
+                self.assertEqual(item.find("enclosure").get("url"), "https://example.org/fixture.mp3")
+
     def test_private_rss_artwork(self):
         feed_path = f"/private/{self.access.token('feed')}/feed.xml"
         episode_art = "https://example.org/episode.jpg?size=large&v=2"

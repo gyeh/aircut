@@ -377,10 +377,17 @@ class Library:
         return dict(_episode_dict(row), ads=json.loads(row["ads"]))
 
     def list_ready(self):
+        return self._list_for_feed(("ready",))
+
+    def list_for_feed(self):
+        return self._list_for_feed(("queued", "processing", "failed", "ready"))
+
+    def _list_for_feed(self, statuses):
+        placeholders = ",".join("?" for _ in statuses)
         with self._db() as con:
-            rows = con.execute(f"""SELECT {_EPISODE_FIELDS},e.audio_path,e.takeaways,e.summary
-                FROM episodes e JOIN feeds f ON f.id=e.feed_id WHERE e.status='ready'
-                ORDER BY COALESCE(NULLIF(e.published,''),e.discovered) DESC,e.id DESC""")
+            rows = con.execute(f"""SELECT {_EPISODE_FIELDS},e.audio_url,e.audio_path,e.takeaways,e.summary
+                FROM episodes e JOIN feeds f ON f.id=e.feed_id WHERE e.status IN ({placeholders})
+                ORDER BY COALESCE(NULLIF(e.published,''),e.discovered) DESC,e.id DESC""", statuses)
             return [_episode_dict(row) for row in rows]
 
     def delete_episode(self, episode_id):

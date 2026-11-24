@@ -51,27 +51,42 @@ def private_rss(library, access, base):
                        ("language", "en"), (f"{{{ITUNES}}}author", "Aircut")):
         ET.SubElement(channel, tag).text = value
     ET.SubElement(channel, f"{{{ITUNES}}}image", href=base + "/static/cover.png")
-    for episode in library.list_ready():
-        path = Path(episode["audio_path"])
-        try:
-            info = path.stat()
-        except FileNotFoundError:
-            continue
-        if not stat.S_ISREG(info.st_mode):
-            continue
+    for episode in library.list_for_feed():
+        title = episode["title"]
+        duration = episode["original_duration"]
+        if episode["status"] == "ready":
+            try:
+                info = Path(episode["audio_path"]).stat()
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                continue
+            media = f"/audio/{episode['id']}.mp3"
+            url = f"{base}{media}?key={access.token(media)}"
+            mime, length = "audio/mpeg", info.st_size
+            duration = episode["duration"]
+            description = episode["takeaways"] + "\n\n" + episode["summary"]
+        else:
+            url = episode["audio_url"]
+            mime = mimetypes.guess_type(urlsplit(url).path)[0]
+            if not mime or not mime.startswith("audio/"):
+                mime = "audio/mpeg"
+            length = 0
+            title += " [Original with ads]"
+            description = "Original audio. Ads have not been removed.\n\n" + episode["description"]
         item = ET.SubElement(channel, "item")
-        ET.SubElement(item, "title").text = episode["title"]
+        ET.SubElement(item, "title").text = title
         ET.SubElement(item, f"{{{ITUNES}}}author").text = episode["feed_title"]
         if episode["image_url"]:
             ET.SubElement(item, f"{{{ITUNES}}}image", href=episode["image_url"])
         guid = f"aircut-{access.token('guid')[:16]}-{episode['id']}"
         ET.SubElement(item, "guid", isPermaLink="false").text = guid
-        ET.SubElement(item, "description").text = episode["takeaways"] + "\n\n" + episode["summary"]
+        ET.SubElement(item, "description").text = description
         if episode["published"]:
             ET.SubElement(item, "pubDate").text = format_datetime(datetime.fromisoformat(episode["published"]))
-        ET.SubElement(item, f"{{{ITUNES}}}duration").text = str(round(episode["duration"]))
-        media = f"/audio/{episode['id']}.mp3"
-        ET.SubElement(item, "enclosure", url=f"{base}{media}?key={access.token(media)}", type="audio/mpeg", length=str(info.st_size))
+        if duration:
+            ET.SubElement(item, f"{{{ITUNES}}}duration").text = str(round(duration))
+        ET.SubElement(item, "enclosure", url=url, type=mime, length=str(length))
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
