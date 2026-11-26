@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from calendar import monthrange
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -31,6 +32,13 @@ XML_BASE = "{http://www.w3.org/XML/1998/namespace}base"
 
 def _now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _retention_cutoff(now, months):
+    month_index = now.year * 12 + now.month - 1 - months
+    year, month_index = divmod(month_index, 12)
+    month = month_index + 1
+    return now.replace(year=year, month=month, day=min(now.day, monthrange(year, month)[1]))
 
 
 def _local(tag):
@@ -231,6 +239,21 @@ def _episode_dict(row):
     return dict(row, has_audio=bool(row["has_audio"]), is_saved=bool(row["is_saved"]))
 
 
+def episode_ad_totals(ads, original_duration):
+    """Count overlapping cut time once and each named advertiser once per episode."""
+    seconds = previous_end = 0.0
+    brands = {}
+    for ad in sorted(ads, key=lambda ad: ad["start"]):
+        end = min(ad["end"], original_duration) if original_duration > 0 else ad["end"]
+        seconds += max(0, end - max(ad["start"], previous_end))
+        previous_end = max(previous_end, end)
+        for name in ad.get("advertisers", []):
+            name = name.strip()
+            if name:
+                brands.setdefault(name.casefold(), name)
+    return seconds, brands
+
+
 class PlaybackConflict(Exception):
     def __init__(self, position, revision):
         super().__init__("A newer playback position has already been saved.")
@@ -243,12 +266,15 @@ class _Interrupted(Exception):
 
 
 class Library:
-    def __init__(self, data_dir: Path, poll_minutes: int = 30):
+    def __init__(self, data_dir: Path, poll_minutes: int = 30, retention_months: int = 0):
         if poll_minutes <= 0:
             raise ValueError("The feed polling interval must be positive.")
         self.data_dir = Path(data_dir).resolve()
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.poll_minutes = poll_minutes
+        if type(retention_months) is not int or not 0 <= retention_months <= 120:
+            raise ValueError("Episode retention must be between 0 and 120 months.")
+        self.retention_months = retention_months
         self.db_path = self.data_dir / "library.sqlite3"
         self._stop = threading.Event()
         self._poll_wake = threading.Event()
@@ -296,8 +322,11 @@ class Library:
             con.execute("UPDATE episodes SET status='queued',stage='Waiting to resume' WHERE status='processing'")
             con.execute("UPDATE episodes SET worker_active=0 WHERE worker_active=1")
         self._stop.clear()
-        self._threads = [threading.Thread(name=name, target=run, daemon=True)
-                         for name, run in [("feed-poller", self._poll_loop), ("episode-worker", self._work_loop)]]
+        workers = [("feed-poller", self._poll_loop), ("episode-worker", self._work_loop)]
+        if self.retention_months:
+            self._expire_episodes()
+            workers.append(("episode-retention", self._retention_loop))
+        self._threads = [threading.Thread(name=name, target=run, daemon=True) for name, run in workers]
         for thread in self._threads:
             thread.start()
 
@@ -314,6 +343,13 @@ class Library:
     def list_feeds(self):
         with self._db() as con:
             return [dict(row) for row in con.execute(f"SELECT {_FEED_FIELDS} FROM feeds WHERE active=1 ORDER BY title COLLATE NOCASE,id")]
+
+    def get_active_feed(self, feed_id):
+        with self._db() as con:
+            row = con.execute(f"SELECT {_FEED_FIELDS} FROM feeds WHERE id=? AND active=1", (feed_id,)).fetchone()
+        if row is None:
+            raise KeyError("Subscription not found.")
+        return dict(row)
 
     def player_settings(self):
         with self._db() as con:
@@ -379,15 +415,54 @@ class Library:
     def list_ready(self):
         return self._list_for_feed(("ready",))
 
-    def list_for_feed(self):
-        return self._list_for_feed(("queued", "processing", "failed", "ready"))
+    def ad_stats(self):
+        shows = {}
+        advertisers = {}
+        with self._db() as con:
+            rows = con.execute("""SELECT e.feed_id, f.title, e.original_duration, e.ads
+                FROM episodes e JOIN feeds f ON e.feed_id=f.id WHERE e.status='ready' ORDER BY e.id""")
+            for row in rows:
+                duration = row["original_duration"]
+                removed, brands = episode_ad_totals(json.loads(row["ads"]), duration)
+                show = shows.setdefault(row["feed_id"], {
+                    "id": row["feed_id"], "title": row["title"], "episodes": 0, "removed_seconds": 0.0,
+                    "original_seconds": 0.0, "timed_removed_seconds": 0.0, "missing_duration": 0,
+                })
+                show["episodes"] += 1
+                show["removed_seconds"] += removed
+                if duration > 0:
+                    show["original_seconds"] += duration
+                    show["timed_removed_seconds"] += removed
+                else:
+                    show["missing_duration"] += 1
+                for key, name in brands.items():
+                    advertiser = advertisers.setdefault(key, {"name": name, "episodes": 0})
+                    advertiser["episodes"] += 1
 
-    def _list_for_feed(self, statuses):
+        for show in shows.values():
+            original = show["original_seconds"]
+            removed = show.pop("timed_removed_seconds")
+            show["percent"] = 100 * removed / original if original else None
+        podcasts = sorted(shows.values(), key=lambda s: (
+            s["percent"] is None, -(s["percent"] or 0), s["title"].casefold(), s["id"]))
+        return {
+            "episodes": sum(s["episodes"] for s in podcasts),
+            "removed_seconds": sum(s["removed_seconds"] for s in podcasts),
+            "podcasts": podcasts,
+            "advertisers": sorted(advertisers.values(), key=lambda a: (-a["episodes"], a["name"].casefold())),
+        }
+
+    def list_for_feed(self, feed_id=None):
+        return self._list_for_feed(("queued", "processing", "failed", "ready"), feed_id)
+
+    def _list_for_feed(self, statuses, feed_id=None):
         placeholders = ",".join("?" for _ in statuses)
+        feed_filter = "" if feed_id is None else "AND e.feed_id=?"
+        params = statuses if feed_id is None else (*statuses, feed_id)
         with self._db() as con:
             rows = con.execute(f"""SELECT {_EPISODE_FIELDS},e.audio_url,e.audio_path,e.takeaways,e.summary
-                FROM episodes e JOIN feeds f ON f.id=e.feed_id WHERE e.status IN ({placeholders})
-                ORDER BY COALESCE(NULLIF(e.published,''),e.discovered) DESC,e.id DESC""", statuses)
+                FROM episodes e JOIN feeds f ON f.id=e.feed_id WHERE e.status IN ({placeholders}) {feed_filter}
+                ORDER BY COALESCE(NULLIF(e.published,''),e.discovered) DESC,e.id DESC""", params)
             return [_episode_dict(row) for row in rows]
 
     def delete_episode(self, episode_id):
@@ -397,16 +472,44 @@ class Library:
             if row is None:
                 raise KeyError("Episode not found.")
             if row["status"] not in ("deleting", "deleted"):
-                identities = {row["episode_key"], "url:" + row["audio_url"]}
-                con.executemany("INSERT OR IGNORE INTO deleted_episode_identities VALUES(?,?)",
-                                [(row["feed_id"], identity) for identity in identities])
-                # Retaining the row reserves its numeric ID for previously issued audio links.
-                con.execute("""UPDATE episodes SET status='deleting',stage='',error='',title='',description='',
-                            published='',image_url='',discovered='',transcript='',summary='',takeaways='',ads='[]',
-                            duration=0,original_duration=0,audio_path='',is_saved=0,playback_position=0,
-                            playback_revision=0 WHERE id=?""", (row["id"],))
+                self._mark_deleted(con, row)
         self._work_wake.set()
         return {"ok": True, "cleanup_pending": not self._clean_deleted_episode(row["id"])}
+
+    @staticmethod
+    def _mark_deleted(con, row):
+        identities = {row["episode_key"], "url:" + row["audio_url"]}
+        con.executemany("INSERT OR IGNORE INTO deleted_episode_identities VALUES(?,?)",
+                        [(row["feed_id"], identity) for identity in identities])
+        # Retaining the row reserves its numeric ID for previously issued audio links.
+        con.execute("""UPDATE episodes SET status='deleting',stage='',error='',title='',description='',
+                    published='',image_url='',discovered='',transcript='',summary='',takeaways='',ads='[]',
+                    duration=0,original_duration=0,audio_path='',is_saved=0,playback_position=0,
+                    playback_revision=0 WHERE id=?""", (row["id"],))
+
+    def _expire_episodes(self, now=None):
+        if not self.retention_months:
+            return 0
+        cutoff = _retention_cutoff(now or datetime.now(timezone.utc), self.retention_months)
+        with self._db(write=True) as con:
+            rows = list(con.execute(
+                """SELECT id,feed_id,episode_key,audio_url FROM episodes
+                   WHERE status NOT IN ('skipped','processing','deleting','deleted')
+                   AND worker_active=0 AND is_saved=0
+                   AND julianday(published) < julianday(?)""", (cutoff.isoformat(),)))
+            for row in rows:
+                self._mark_deleted(con, row)
+        if rows:
+            LOG.info("Expired %d Aircut episodes older than %d months.", len(rows), self.retention_months)
+            self._work_wake.set()
+        return len(rows)
+
+    def _retention_loop(self):
+        while not self._stop.wait(900):
+            try:
+                self._expire_episodes()
+            except Exception:
+                LOG.exception("Episode retention interrupted")
 
     def _clean_deleted_episode(self, episode_id):
         # Serialize cleanup with the worker's claim/release and duplicate requests.
@@ -472,9 +575,15 @@ class Library:
     def _ingest(self, con, feed_id, snapshot, baseline, backfill, now):
         # Initial subscription records the entire snapshot. Reordering old GUIDs never queues them.
         # Without dates, RSS/Atom document order determines the most recent entries.
+        cutoff = (_retention_cutoff(datetime.fromisoformat(now), self.retention_months).isoformat()
+                  if self.retention_months else "")
+        def eligible(entry):
+            return not cutoff or not entry.published or entry.published >= cutoff
+
         selected = set()
         if backfill is not None:
-            ranked = sorted(snapshot.entries, key=lambda entry: entry.published, reverse=True)
+            ranked = sorted((entry for entry in snapshot.entries if eligible(entry)),
+                            key=lambda entry: entry.published, reverse=True)
             selected = {entry.key for entry in ranked[:backfill]}
         existing = list(con.execute("SELECT id,episode_key,audio_url,status FROM episodes WHERE feed_id=?", (feed_id,)))
         by_key = {row["episode_key"]: row for row in existing}
@@ -497,7 +606,7 @@ class Library:
                     con.execute("UPDATE episodes SET status='queued',stage='Queued',error='' WHERE id=?", (previous["id"],))
                 continue
             if backfill is None:
-                queue = not entry.published or entry.published >= baseline
+                queue = eligible(entry) and (not entry.published or entry.published >= baseline)
             else:
                 queue = entry.key in selected
             con.execute("""INSERT INTO episodes(feed_id,episode_key,audio_url,title,description,published,image_url,

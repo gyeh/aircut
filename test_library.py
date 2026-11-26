@@ -1,4 +1,5 @@
 import concurrent.futures
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import threading
@@ -65,6 +66,53 @@ class LibraryTest(unittest.TestCase):
         download = patch("podcast_library.fetch_feed", return_value=(rss(1, 3, 2, 3), FEED))
         self.fetch = download.start()
         self.addCleanup(download.stop)
+
+    def test_calendar_month_expiration_keeps_saved_undated_and_boundary(self):
+        lib = self.library
+        lib.subscribe(FEED, backfill=3)
+        ids = {e["title"]: e["id"] for e in lib.list_episodes()}
+        with lib._db(write=True) as con:
+            con.execute("UPDATE episodes SET published='2026-02-28T11:59:59+00:00' WHERE id=?",
+                        (ids["Episode 1"],))
+            con.execute("UPDATE episodes SET published='2026-02-28T12:00:00+00:00' WHERE id=?",
+                        (ids["Episode 2"],))
+            con.execute("UPDATE episodes SET published='',is_saved=1 WHERE id=?", (ids["Episode 3"],))
+        now = datetime(2026, 4, 30, 12, tzinfo=timezone.utc)
+        folder = lib.data_dir / "episodes" / str(ids["Episode 1"])
+        folder.mkdir(parents=True)
+        (folder / "clean.mp3").write_bytes(b"test")
+        self.assertEqual(lib._expire_episodes(now), 0)
+        self.assertTrue(folder.is_dir())
+        lib.retention_months = 2
+        self.assertEqual(lib._expire_episodes(now), 1)
+        self.assertEqual(lib._expire_episodes(now), 0)
+        self.assertEqual(set(e["id"] for e in lib.list_episodes()), {ids["Episode 2"], ids["Episode 3"]})
+        self.assertTrue(lib._clean_deleted_episode(ids["Episode 1"]))
+        self.assertFalse(folder.exists())
+        with lib._db() as con:
+            self.assertEqual(con.execute("SELECT status FROM episodes WHERE id=?",
+                                         (ids["Episode 1"],)).fetchone()[0], "deleted")
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM deleted_episode_identities").fetchone()[0], 2)
+
+    def test_expiration_skips_saved_undated_and_processing_independently(self):
+        lib = self.library
+        self.fetch.return_value = rss(1, 2, 3, 4), FEED
+        lib.subscribe(FEED, backfill=4)
+        with lib._db(write=True) as con:
+            con.execute("UPDATE episodes SET is_saved=1 WHERE title='Episode 1'")
+            con.execute("UPDATE episodes SET published='' WHERE title='Episode 2'")
+            con.execute("UPDATE episodes SET status='processing',worker_active=1 WHERE title='Episode 3'")
+        lib.retention_months = 2
+        now = datetime(2026, 4, 30, tzinfo=timezone.utc)
+        self.assertEqual(lib._expire_episodes(now), 1)
+        self.assertEqual({e["title"] for e in lib.list_episodes()}, {"Episode 1", "Episode 2", "Episode 3"})
+
+    def test_retention_backfill_does_not_queue_expired_episodes(self):
+        lib = self.library
+        lib.retention_months = 2
+        with patch("podcast_library._now", return_value="2026-04-30T12:00:00+00:00"):
+            lib.subscribe(FEED, backfill=3)
+        self.assertEqual(lib.list_episodes(), [])
 
     def test_reorder_baseline_retry_and_retention(self):
         lib = self.library

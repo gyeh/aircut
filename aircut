@@ -37,7 +37,9 @@ case "${1:-run}" in
     echo "Stopped Aircut."
     ;;
   status)
-    if launchctl list "$service" >/dev/null 2>&1; then
+    # A shell outside the GUI bootstrap domain can miss the LaunchAgent in launchctl list.
+    if launchctl print "gui/$(id -u)/$service" >/dev/null 2>&1 ||
+       launchctl list "$service" >/dev/null 2>&1; then
       if ready; then
         echo "Aircut is running at http://127.0.0.1:8765"
       else

@@ -63,6 +63,11 @@ class Access:
     def token(self, purpose):
         return hmac.new(self.secret, purpose.encode(), hashlib.sha256).hexdigest()
 
+    def feed_path(self, feed_id=None):
+        if feed_id is None:
+            return f"/private/{self.token('feed')}/feed.xml"
+        return f"/private/{self.token(f'feed/{feed_id}')}/feeds/{feed_id}.xml"
+
     def session(self):
         value = f"{int(time.time()) + 60 * 86400}.{secrets.token_hex(12)}"
         return value + "." + self.token("session/" + value)
@@ -78,7 +83,7 @@ class Access:
         with self.lock:
             base = self.url or local_url
             return {
-                "rss_url": f"{base}/private/{self.token('feed')}/feed.xml",
+                "rss_url": base + self.feed_path(),
                 "remote_url": (self.url + ("/pair#" + self.token("pair") if local else "/")) if self.url else "",
                 "can_start_tunnel": local and not self.fixed_url and os.access(self.tunnel_bin, os.X_OK),
                 "tunnel_starting": self.process is not None and not self.url,

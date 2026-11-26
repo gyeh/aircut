@@ -295,14 +295,54 @@ function renderFeeds() {
   }).join('');
   main.innerHTML = `<div class="heading-row"><div><h1>Subscriptions</h1><p>${countLabel(feeds.length,'feed')} · Checking every ${countLabel(state.settings.poll_minutes,'minute')}</p></div>${button('subscribe','Add feed','plus')}</div>${feeds.length ? `<div class="feed-heading"><h2>Your feeds</h2>${button('refresh','Check feeds','refresh','quiet')}</div>${rows}` : `<section class="list-empty"><p>Your subscribed shows will appear here. Add a podcast’s RSS feed to start.</p></section>`}`;
 }
+let lastAdStats = '';
+async function loadAdStats(request) {
+  document.title = 'Ad stats — Aircut';
+  if (!$('#stats-report')) main.innerHTML = '<p class="loading" role="status">Loading ad stats…</p>';
+  try {
+    const stats = await api('/api/ad-stats');
+    if (request !== detailRequest) return;
+    const fingerprint = JSON.stringify(stats);
+    if ($('#stats-report') && fingerprint === lastAdStats) return;
+    lastAdStats = fingerprint;
+    const time = seconds => timeLabel(Math.round(seconds * 1000) / 1000 + 0.5);
+    const seconds = Math.floor(Math.round(stats.removed_seconds * 1000) / 1000 + 0.5);
+    const totalTime = [Math.floor(seconds / 3600) + 'h', Math.floor(seconds / 60) % 60 + 'm', seconds % 60 + 's'];
+    const podcasts = stats.podcasts.map(show => {
+      const percent = show.percent === null ? '—' : show.percent.toFixed(1) + '%';
+      return `<tr><th scope="row">${escapeHtml(show.title)}</th><td>${show.episodes}</td><td>${time(show.removed_seconds)}</td>
+        <td>${percent}${show.percent === null ? '' : `<span class="stats-track" aria-hidden="true"><i style="width:${show.percent}%"></i></span>`}</td></tr>`;
+    });
+    const advertisers = stats.advertisers.map(a => `<tr><th scope="row">${escapeHtml(a.name)}</th><td>${a.episodes}</td></tr>`);
+    function ranking(id, title, explanation, columns, rows, empty) {
+      const expanded = document.getElementById(id)?.classList.contains('expanded') || false;
+      const more = rows.length > 10 ? `<button type="button" class="quiet" data-action="toggle-ranking" aria-controls="${id}-table" aria-expanded="${expanded}">${expanded ? 'Show fewer' : 'Show all ' + rows.length}</button>` : '';
+      const table = `<table id="${id}-table" aria-labelledby="${id}-title"><thead><tr>${columns.map(c => `<th scope="col">${c}</th>`).join('')}</tr></thead><tbody>${rows.join('')}</tbody></table>`;
+      return `<section class="stats-ranking${expanded ? ' expanded' : ''}" id="${id}"><h2 id="${id}-title">${title}</h2><p>${explanation}</p>${rows.length ? table + more : `<p>${empty}</p>`}</section>`;
+    }
+    const missing = stats.podcasts.some(s => s.missing_duration);
+    main.innerHTML = `<div id="stats-report"><div class="heading-row"><div><h1>Ad stats</h1><p>Completed episodes in your library</p></div></div>
+      <dl class="stats-totals"><div><dt>Total ad time removed</dt><dd>${totalTime.join(' ')}</dd></div>
+      <div><dt>Episodes</dt><dd>${stats.episodes}</dd></div><div><dt>Podcasts</dt><dd>${stats.podcasts.length}</dd></div></dl>
+      ${stats.episodes ? `<div class="stats-rankings">
+        ${ranking('stats-podcasts','Ad share by podcast','Removed time as a share of original runtime, including episodes with no cuts.' + (missing ? ' Episodes with unknown runtime are excluded from percentages.' : ''),['Podcast','Episodes','Removed','Ad share'],podcasts)}
+        ${ranking('stats-advertisers','Most frequent advertisers','Each identified advertiser counts once per episode, even across multiple breaks.',['Advertiser','Episodes'],advertisers,'No advertisers have been identified.')}
+      </div>` : '<p class="list-empty">Stats will appear when Aircut finishes processing an episode.</p>'}</div>`;
+  } catch (err) {
+    if (request === detailRequest) showError(main, err.message);
+  }
+}
+
 function renderRoute() {
   if (!state) return;
   const {page, id, fromSaved} = route();
   const savedPage = supportsSavedEpisodes() && (page === 'saved' || (page === 'episode' && fromSaved));
   $('#nav-saved').hidden = !supportsSavedEpisodes();
   $('#nav-saved').toggleAttribute('aria-current', savedPage);
-  $('#nav-library').toggleAttribute('aria-current', page !== 'feeds' && !savedPage);
+  $('#nav-library').toggleAttribute('aria-current', !['feeds','rss','ad-stats'].includes(page) && !savedPage);
   $('#nav-feeds').toggleAttribute('aria-current', page === 'feeds');
+  $('#nav-rss').toggleAttribute('aria-current', page === 'rss');
+  $('#nav-stats').toggleAttribute('aria-current', page === 'ad-stats');
   for (const el of document.querySelectorAll('nav [aria-current]')) el.setAttribute('aria-current', 'page');
   if (page === 'episode' && id) {
     loadEpisode(id);
@@ -311,6 +351,8 @@ function renderRoute() {
   detailRequest++;
   detail = undefined;
   if (page === 'feeds') renderFeeds();
+  else if (page === 'ad-stats') loadAdStats(detailRequest);
+  else if (page === 'rss') renderRssFeeds();
   else if (savedPage) renderSaved();
   else renderLibrary(page === 'feed' ? id : '');
 }
@@ -374,10 +416,14 @@ function renderEpisode() {
   const retry = e.status === 'failed' ? button('retry', 'Retry episode', 'refresh', 'button outline') : '';
   const stage = e.status === 'processing' || e.status === 'queued' ? `<p class="setup-note" role="status">${escapeHtml(e.stage || 'Waiting to process')}${!state.settings.processing_ready ? ` · ${escapeHtml(state.settings.setup_hint || 'Processing setup required')}` : ''}</p>` : '';
   const sections = [];
-  if (e.takeaways) sections.push(`<section class="notes"><h2>Main takeaways</h2><div class="prose">${prose(e.takeaways)}</div></section>`);
-  if (e.summary) sections.push(`<section class="notes"><h2>Comprehensive summary</h2><div class="prose">${prose(e.summary)}</div></section>`);
+  if (e.briefing_html) {
+    sections.push(`<article class="notes prose briefing">${e.briefing_html}</article>`);
+  } else {
+    if (e.takeaways) sections.push(`<section class="notes"><h2>Main takeaways</h2><div class="prose">${prose(e.takeaways)}</div></section>`);
+    if (e.summary) sections.push(`<section class="notes"><h2>Comprehensive summary</h2><div class="prose">${prose(e.summary)}</div></section>`);
+  }
   if (e.transcript) sections.push(`<details class="notes"><summary>Transcript</summary><p class="transcript">${escapeHtml(e.transcript)}</p></details>`);
-  if (e.status === 'ready' && Array.isArray(e.ads)) sections.push(`<details class="notes"><summary>Removed ads <span class="count">${e.ads.length}</span></summary>${e.ads.length ? '<p class="subtle">Times refer to the original recording.</p>' + e.ads.map(a => `<p class="ad-row"><b>${timeLabel(a.start)}–${timeLabel(a.end)}</b>${escapeHtml(a.reason)}</p>`).join('') : '<p class="subtle">No ad segments were detected.</p>'}</details>`);
+  if (e.removed_ads_html) sections.push(e.removed_ads_html);
   const view = route(), back = episodeListLink(view);
   const backLabel = back === '#saved' ? 'Saved episodes' : findFeed(view.fromFeed)?.title || 'Library';
   main.innerHTML = `<a href="${back}" class="page-back">${icon('back')} ${escapeHtml(backLabel)}</a><div class="detail-head">${cover(e.title, e.image_url || feed?.image_url, e.id)}<div class="episode-heading"><p class="detail-meta">${escapeHtml(meta)}</p><h1>${escapeHtml(e.title)}</h1><div class="detail-actions">${play}${saveButton(e, true)}${statusPill(e)}${retry}${deleteButton(e, true)}</div>${stage}</div></div><div class="detail-body">${e.error ? `<p class="form-error" role="alert">${escapeHtml(e.error)}</p>` : ''}${e.description ? `<details class="notes"><summary>Episode description</summary><p class="transcript">${escapeHtml(e.description)}</p></details>` : ''}${sections.join('')}</div>`;
@@ -413,7 +459,17 @@ function renderServer() {
   openDialog('server','settings',`<h2 id="dialog-title">Server details</h2>${params.map(([key,value]) => `<div class="setting-line"><strong>${escapeHtml(key)}</strong><span>${escapeHtml(value)}</span></div>`).join('')}${extra}<div class="action-list">${playerSettingsSupported() ? button('player-settings', 'Playback settings', 'settings', 'button outline') : ''}${button('refresh', 'Check feeds now', 'refresh', 'button outline')}${button('device', 'iPhone access', 'phone', 'button outline')}</div>`);
 }
 function linkBlock(title, url, how, key) {
-  return `<div class="link-block"><label for="${key}-url">${escapeHtml(title)}</label><p>${escapeHtml(how)}</p><div class="link-input"><input type="text" aria-label="${title}" readonly id="${key}-url" value="${escapeHtml(url)}" spellcheck="false"><button type="button" class="button outline" data-action="copy" data-key="${key}" aria-label="Copy ${title}">${icon('copy')} Copy</button></div></div>`;
+  return `<div class="link-block"><label for="${key}-url">${escapeHtml(title)}</label>${how ? `<p>${escapeHtml(how)}</p>` : ''}<div class="link-input"><input type="text" readonly id="${key}-url" value="${escapeHtml(url)}" spellcheck="false"><button type="button" class="button outline" data-action="copy" data-key="${key}" aria-label="Copy ${escapeHtml(title)}">${icon('copy')} Copy</button></div></div>`;
+}
+function renderRssFeeds() {
+  document.title = 'RSS feeds — Aircut';
+  const {settings, feeds} = state;
+  const hint = settings.remote_url ? 'Paste a private feed URL into your podcast app.' : 'These links work on this computer. Enable iPhone access to use them on another device.';
+  const combined = linkBlock('All podcasts', settings.rss_url, '', 'combined');
+  const shows = feeds.map(feed => linkBlock(feed.title, feed.rss_url, '', `show-${feed.id}`)).join('');
+  main.innerHTML = `<div class="heading-row"><div><h1>RSS feeds</h1><p>${hint}</p></div></div>
+    <div class="action-list">${button('copy-feeds', 'Copy all URLs', 'copy')}<a class="button outline" href="/feeds.txt">Open feeds.txt</a></div>
+    <div class="rss-directory">${combined}${shows}</div>`;
 }
 function renderDevice() {
   if (!state) return;
@@ -448,14 +504,16 @@ function renderDevice() {
 async function copyLink(key) {
   const input = document.getElementById(`${key}-url`);
   if (!input) return;
-  const feedback = $('#device-feedback');
+  const feedback = input.closest('dialog') && $('#device-feedback');
   let copied = false;
   try { await navigator.clipboard.writeText(input.value); copied = true; }
   catch {
     input.focus(); input.select(); input.setSelectionRange(0, input.value.length);
     try { copied = document.execCommand('copy'); } catch { /* Manual copy is available in the input. */ }
   }
-  feedback.textContent = copied ? 'Link copied.' : 'Select and copy the link above.';
+  const message = copied ? 'Link copied.' : 'Select and copy the link.';
+  if (feedback) feedback.textContent = message;
+  else toast(message);
 }
 async function subscribe(form) {
   const url = form.elements.url.value.trim();
@@ -519,6 +577,13 @@ document.addEventListener('click', async event => {
   if (!state && !['reload','close-dialog'].includes(action)) { toast('Waiting for the server.'); return; }
   try {
     switch (action) {
+      case 'toggle-ranking': {
+        const table = document.getElementById(control.getAttribute('aria-controls'));
+        const expanded = table.closest('.stats-ranking').classList.toggle('expanded');
+        control.setAttribute('aria-expanded', expanded);
+        control.textContent = expanded ? 'Show fewer' : 'Show all ' + table.tBodies[0].rows.length;
+        break;
+      }
       case 'reload': await loadState(true); break;
       case 'subscribe': openSubscribe(); break;
       case 'save-episode': await toggleSavedEpisode(control); break;
@@ -528,6 +593,13 @@ document.addEventListener('click', async event => {
       case 'server': renderServer(); break;
       case 'device': renderDevice(); break;
       case 'copy': await copyLink(control.dataset.key); break;
+      case 'copy-feeds':
+        try {
+          const urls = Array.from(main.querySelectorAll('.rss-directory input'), input => input.value);
+          await navigator.clipboard.writeText(urls.join('\n') + '\n');
+          toast('Feed URLs copied.');
+        } catch { toast('Open feeds.txt to select and copy all URLs.'); }
+        break;
       case 'start-tunnel': await startTunnel(); break;
       case 'request-stop-tunnel':
         openDialog('stop-tunnel', 'phone', `<h2 id="dialog-title">Disable iPhone access?</h2><p>This closes the temporary connection and stops remote playback. Enabling it again creates new links.</p><div class="form-error" role="alert"></div><div class="action-list">${button('stop-tunnel', 'Disable access', '', 'button danger')}${button('device', 'Cancel', '', 'button outline')}</div>`);

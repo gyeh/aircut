@@ -112,10 +112,12 @@ class ProcessingTests(unittest.TestCase):
     def test_close_cuts_chain_and_remove_intervening_speech_from_notes(self):
         spans = [(0, 2), (2, 4), (4, 8), (8, 10), (10, 15), (15, 17), (17, 22.01), (22.01, 24)]
         segments = [{"start": a, "end": b, "text": f"Line {i}"} for i, (a, b) in enumerate(spans)]
-        decision = {"ads": [{"first": i, "last": i, "reason": "Sponsor."} for i in (1, 3, 5, 7)]}
+        decision = {"ads": [{"first": i, "last": i, "reason": "Sponsor.", "advertisers": [brand]}
+                            for i, brand in ((1, "A"), (3, "B"), (5, "A"), (7, "C"))]}
         with tempfile.TemporaryDirectory() as folder, patch.object(pipeline, "_ask", return_value=decision):
             ads, removed = pipeline._detect_ads(segments, "Test", Path(folder), lambda stage: None)
         self.assertEqual([(ad["start"], ad["end"]) for ad in ads], [(2, 17), (22.01, 24)])
+        self.assertEqual([ad["advertisers"] for ad in ads], [["A", "B"], ["C"]])
         self.assertEqual(removed, {1, 2, 3, 4, 5, 7})
 
     def test_long_multilingual_episode_includes_last_section(self):
@@ -161,13 +163,26 @@ class ProcessingTests(unittest.TestCase):
                 if schema == pipeline.AD_SCHEMA:
                     return {"ads": [{"first": 1, "last": 1, "reason": "Sponsor code and offer."}]}
                 self.assertNotIn("sponsor", content["material"].lower())
-                return {"text": "Daily records make comparisons easier."}
+                self.assertEqual(schema, pipeline.BRIEFING_SCHEMA)
+                return {"big_idea": "A daily rainfall record makes later comparisons possible.",
+                        "themes": [{"heading": "Collect observations consistently",
+                                    "body": "A morning reading gives each day a comparable observation."}],
+                        "nuance": "", "references": [],
+                        "quotes": [{"words": "Record rainfall each morning.", "speaker": "Speaker",
+                                    "context": "The speaker explains when to take a reading."},
+                                   {"words": "Invented quote.", "speaker": "Speaker", "context": "Example."}],
+                        "takeaways": ["Keep dated notes so that later comparisons use the original readings."]}
 
             def download(url, path, *, max_bytes):
                 shutil.copyfile(source, path)
 
-            with patch.dict(os.environ, {"OPENAI_API_KEY": "fixture", "PODCAST_LLM_BACKEND": "openai"}, clear=True), \
-                 patch.dict(os.environ, {"PATH": os.defpath + ":/opt/homebrew/bin:/usr/local/bin"}), \
+            media_path = os.pathsep.join(dict.fromkeys(
+                str(Path(shutil.which(tool)).parent) for tool in ("ffmpeg", "ffprobe")
+            ))
+            with patch.dict(os.environ, {
+                    "OPENAI_API_KEY": "fixture", "PODCAST_LLM_BACKEND": "openai",
+                    "PATH": media_path + os.pathsep + os.defpath,
+                 }, clear=True), \
                  patch("podcast_network.download_to", side_effect=download) as downloader, \
                  patch.object(pipeline, "_transcribe", return_value=rows) as speech, \
                  patch.object(pipeline, "_ask", side_effect=ask):
@@ -177,7 +192,12 @@ class ProcessingTests(unittest.TestCase):
 
             self.assertEqual(downloader.call_count, 1)
             self.assertEqual(speech.call_count, 1)
-            self.assertEqual(calls, [pipeline.AD_TASK, pipeline.TAKEAWAYS, pipeline.SUMMARY])
+            self.assertEqual(calls, [pipeline.AD_TASK, pipeline.BRIEFING])
+            self.assertTrue(result["summary"].startswith("## The Big Idea"))
+            self.assertIn("> “Record rainfall each morning.”", result["summary"])
+            self.assertNotIn("Invented quote", result["summary"])
+            self.assertNotIn("## Nuance", result["summary"])
+            self.assertTrue(result["summary"].endswith("## Lasting Takeaways\n\n" + result["takeaways"]))
             self.assertEqual(result, repeated)
             self.assertEqual(result["ads"][0]["start"], 1)
             self.assertIn("sponsor code", result["transcript"])

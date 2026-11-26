@@ -3,6 +3,7 @@
 import argparse
 from datetime import datetime
 from email.utils import format_datetime
+from html import escape
 from http.cookies import SimpleCookie, CookieError
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hmac
@@ -19,8 +20,9 @@ from urllib.parse import parse_qs, urlsplit
 import xml.etree.ElementTree as ET
 
 from podcast_access import Access, ROOT, configure_runtime
-from podcast_library import Library, PlaybackConflict
-from podcast_processing import processing_readiness
+from podcast_library import Library, PlaybackConflict, episode_ad_totals
+from podcast_processing import format_timestamp, processing_readiness
+from podcast_tailnet import private_page_allowed, verified_serve_origin
 
 ITUNES = "http://www.itunes.com/dtds/podcast-1.0.dtd"
 ET.register_namespace("itunes", ITUNES)
@@ -44,15 +46,99 @@ PAIR_JS = b"""(async () => {
 PAIR_CSS = b"""*{box-sizing:border-box}body{background:#f3f1e8;color:#22251f;font:18px/1.5 system-ui,sans-serif;margin:0;padding:8vw}main{max-width:480px;margin:9vh auto}img{border-radius:14px}h1{font:2.8rem/1.1 Georgia,serif;letter-spacing:-.05em}"""
 
 
-def private_rss(library, access, base):
+def _briefing_html(summary):
+    """Render only the Markdown blocks emitted by the briefing writer."""
+    if not summary.startswith("## The Big Idea\n"):
+        return ""
+    blocks = []
+    for block in re.split(r"\n\s*\n", summary.strip()):
+        if block.startswith("## "):
+            blocks.append(f"<h2>{escape(block[3:])}</h2>")
+        elif block.startswith("### "):
+            blocks.append(f"<h3>{escape(block[4:])}</h3>")
+        elif block.startswith("> "):
+            blocks.append(f"<blockquote>{escape(block[2:])}</blockquote>")
+        elif block.startswith("- "):
+            items = block[2:].split("\n- ")
+            blocks.append("<ul>" + "".join(f"<li>{escape(item)}</li>" for item in items) + "</ul>")
+        else:
+            blocks.append(f"<p>{escape(block)}</p>")
+    return "".join(blocks)
+
+
+def _removed_ads_html(episode):
+    if episode["status"] != "ready":
+        return ""
+    ads = sorted(episode["ads"], key=lambda ad: ad["start"])
+    original = episode["original_duration"]
+    total, brands = episode_ad_totals(ads, original)
+    cuts = []
+    for ad in ads:
+        start, end = ad["start"], ad["end"]
+        advertisers = ad.get("advertisers", [])
+        credit = ", ".join(escape(name) for name in advertisers) or "Advertiser unidentified"
+        cuts.append(f"<li><strong>{format_timestamp(start)}–{format_timestamp(end)}</strong>"
+                    f" · {credit}<br>{escape(ad.get('reason') or '')}</li>")
+    # Cut boundaries are fractional seconds. Round the combined time once for display.
+    stats = f"<p><strong>Ad time removed</strong> · {format_timestamp(round(total, 3) + 0.5)}"
+    if original > 0:
+        stats += f" ({100 * total / original:.1f}% of the original {format_timestamp(round(original))})"
+    stats += "</p>"
+    if ads:
+        names = ", ".join(escape(name) for name in brands.values()) or "Unidentified"
+        body = (f"{stats}<p><strong>Identified brands and advertisers</strong> · {names}</p>"
+                f"<p>Break times refer to the original recording.</p><ol>{''.join(cuts)}</ol>")
+    else:
+        body = f"{stats}<p>No ad breaks were removed.</p>"
+    return (f'<details class="notes removed-ads"><summary>Removed ads <span class="count">{len(ads)}</span>'
+            f'</summary>{body}</details>')
+
+
+def _episode_page(episode):
+    sections = []
+    briefing = _briefing_html(episode["summary"])
+    if briefing:
+        sections.append(f'<article class="briefing">{briefing}</article>')
+    else:
+        for key, heading in (("summary", "Summary"), ("takeaways", "Takeaways")):
+            if episode[key].strip():
+                sections.append(f"<section><h2>{heading}</h2><div>{escape(episode[key])}</div></section>")
+    if episode["transcript"].strip():
+        sections.append('<details><summary>Transcript</summary><p>Timestamps refer to the original recording.</p>'
+                        f'<p class="transcript">{escape(episode["transcript"])}</p></details>')
+    content = "".join(sections) or "<p>Episode notes and transcript are not available yet.</p>"
+    content += _removed_ads_html(episode)
+    title = escape(episode["title"])
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title} — Aircut</title><style>
+:root {{color-scheme:light dark;font:100%/1.65 system-ui,sans-serif}}
+body {{max-width:42rem;margin:auto;padding:clamp(1rem,5vw,3rem);overflow-wrap:anywhere}}
+h1,h2 {{line-height:1.2;text-wrap:balance}} h1 {{font-family:Georgia,serif}}
+section,details {{margin-top:2rem;border-top:1px solid #8887}} section div,.transcript {{white-space:pre-wrap}}
+summary {{padding:.7rem 0;cursor:pointer;font-size:1.3rem;font-weight:600}} .count {{font-size:.85em}}
+li + li {{margin-top:0.75rem}}
+.briefing h2 {{margin:2rem 0 .6rem}} .briefing h3 {{margin:1.5rem 0 .4rem}}
+.briefing blockquote {{margin:1.2rem 0 .5rem;padding-left:1rem;border-left:3px solid #be6739}}
+</style></head><body><main><header><p>Aircut · {escape(episode["feed_title"])}</p><h1>{title}</h1></header>
+{content}</main></body></html>""".encode()
+
+
+def private_rss(library, access, base, feed=None):
     root = ET.Element("rss", version="2.0")
     channel = ET.SubElement(root, "channel")
-    for tag, value in (("title", "Aircut"), ("link", base + "/"), ("description", "Your processed podcasts, with takeaways and summaries."),
+    title = feed["title"] if feed else "Aircut"
+    link = f"{base}/#feed/{feed['id']}" if feed else base + "/"
+    description = f"{title} episodes from Aircut, with takeaways and summaries." if feed else "Your processed podcasts, with takeaways and summaries."
+    for tag, value in (("title", title), ("link", link), ("description", description),
                        ("language", "en"), (f"{{{ITUNES}}}author", "Aircut")):
         ET.SubElement(channel, tag).text = value
-    ET.SubElement(channel, f"{{{ITUNES}}}image", href=base + "/static/cover.png")
-    for episode in library.list_for_feed():
-        title = episode["title"]
+    artwork = feed["image_url"] if feed else ""
+    ET.SubElement(channel, f"{{{ITUNES}}}image", href=artwork or base + "/static/cover.png")
+    notes_origin = verified_serve_origin(access.gateway_port)
+    for episode in library.list_for_feed(feed["id"] if feed else None):
+        title = "🍊 " + episode["title"]
+        briefing = ""
         duration = episode["original_duration"]
         if episode["status"] == "ready":
             try:
@@ -65,7 +151,8 @@ def private_rss(library, access, base):
             url = f"{base}{media}?key={access.token(media)}"
             mime, length = "audio/mpeg", info.st_size
             duration = episode["duration"]
-            description = episode["takeaways"] + "\n\n" + episode["summary"]
+            briefing = _briefing_html(episode["summary"])
+            description = briefing or (episode["takeaways"] + "\n\n" + episode["summary"])
         else:
             url = episode["audio_url"]
             mime = mimetypes.guess_type(urlsplit(url).path)[0]
@@ -81,6 +168,11 @@ def private_rss(library, access, base):
             ET.SubElement(item, f"{{{ITUNES}}}image", href=episode["image_url"])
         guid = f"aircut-{access.token('guid')[:16]}-{episode['id']}"
         ET.SubElement(item, "guid", isPermaLink="false").text = guid
+        if notes_origin:
+            page = f"{notes_origin}/episodes/{episode['id']}/notes"
+            ET.SubElement(item, "link").text = page
+            body = briefing or escape(description).replace("\n", "<br>")
+            description = f'<p><a href="{escape(page, quote=True)}">Read episode notes and transcript</a></p>{body}'
         ET.SubElement(item, "description").text = description
         if episode["published"]:
             ET.SubElement(item, "pubDate").text = format_datetime(datetime.fromisoformat(episode["published"]))
@@ -196,6 +288,12 @@ class Handler(BaseHTTPRequestHandler):
         if self.server.local and not local:
             return self.reply({"error": "Open the local dashboard using localhost or 127.0.0.1."}, 403)
         access, lib = self.server.access, self.server.library
+        notes = re.fullmatch(r"/episodes/([1-9][0-9]{0,17})/notes", path)
+        if notes:
+            if (not reading or self.server.local or self.server.server_port != access.gateway_port
+                    or not private_page_allowed(self.headers, self.client_address, access.gateway_port)):
+                return self.reply({"error": "Open this page through private Tailscale Serve."}, 403)
+            return self.send_data(200, _episode_page(lib.get_episode(int(notes[1]))), "text/html; charset=utf-8")
         state = access.state(local, self.server.local_url)
         base = access.url or self.server.local_url
         if not reading:
@@ -214,9 +312,12 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_data(200, asset.read_bytes(), mimetypes.guess_type(asset.name)[0] or "application/octet-stream")
                 return self.reply({"error":"Asset not found."}, 404)
             if path.startswith("/private/"):
-                if hmac.compare_digest(path.encode(), f"/private/{access.token('feed')}/feed.xml".encode()):
-                    return self.send_data(200, private_rss(lib, access, base), "application/rss+xml; charset=utf-8")
-                return self.reply({"error":"Feed not found."}, 404)
+                show = re.fullmatch(r"/private/[0-9a-f]{64}/feeds/([1-9][0-9]{0,18})\.xml", path)
+                feed_id = int(show[1]) if show else None
+                if not hmac.compare_digest(path.encode(), access.feed_path(feed_id).encode()):
+                    return self.reply({"error":"Feed not found."}, 404)
+                feed = lib.get_active_feed(feed_id) if show else None
+                return self.send_data(200, private_rss(lib, access, base, feed), "application/rss+xml; charset=utf-8")
         if path == "/api/pair" and self.command == "POST":
             key = self.body().get("key")
             if not isinstance(key, str) or not hmac.compare_digest(key.encode(), access.token("pair").encode()):
@@ -232,15 +333,25 @@ class Handler(BaseHTTPRequestHandler):
             return self.audio(lib.get_episode(int(audio[1])))
         if path == "/" and reading:
             return self.send_data(200, (STATIC / "index.html").read_bytes(), "text/html; charset=utf-8")
-        if path == "/api/state" and reading:
+        if path == "/api/ad-stats" and reading:
+            return self.reply(lib.ad_stats())
+        if reading and path in ("/api/state", "/feeds.txt"):
+            feeds = lib.list_feeds()
+            for feed in feeds:
+                feed["rss_url"] = base + access.feed_path(feed["id"])
+            if path == "/feeds.txt":
+                urls = [state["rss_url"], *(feed["rss_url"] for feed in feeds)]
+                return self.send_data(200, ("\n".join(urls) + "\n").encode(), "text/plain; charset=utf-8")
             ready, hint = processing_readiness()
             state.update(processing_ready=ready, setup_hint=hint, poll_minutes=lib.poll_minutes, episode_deletion=True)
-            state.update(lib.player_settings())
-            return self.reply({"feeds": lib.list_feeds(), "episodes": lib.list_episodes(), "settings": state})
+            state.update(lib.player_settings(), retention_months=lib.retention_months)
+            return self.reply({"feeds": feeds, "episodes": lib.list_episodes(), "settings": state})
         detail = re.fullmatch(r"/api/episodes/(\d+)", path)
         if detail and reading:
             episode = dict(lib.get_episode(int(detail[1])))
             episode.pop("audio_path", None)
+            episode["briefing_html"] = _briefing_html(episode["summary"])
+            episode["removed_ads_html"] = _removed_ads_html(episode)
             episode["audio_url"] = f"/audio/{detail[1]}.mp3" if episode["has_audio"] else ""
             return self.reply(episode)
         if detail and self.command == "DELETE":
@@ -320,6 +431,7 @@ def main():
     parser.add_argument("--gateway-port", type=int, default=8766, help="Authenticated loopback gateway (default 8766)")
     parser.add_argument("--data", type=Path, default=ROOT / ".aircut")
     parser.add_argument("--poll-minutes", type=int, default=30)
+    parser.add_argument("--retention-months", type=int, help="Override PODCAST_RETENTION_MONTHS; 0 disables cleanup")
     args = parser.parse_args()
     if not 1 <= args.poll_minutes <= 1440:
         parser.error("--poll-minutes must be between 1 and 1440")
@@ -329,7 +441,15 @@ def main():
     configure_runtime()
     data = args.data.expanduser().resolve()
     data.mkdir(parents=True, exist_ok=True)
-    lib = Library(data, args.poll_minutes)
+    months = args.retention_months
+    if months is None:
+        try:
+            months = int(os.environ.get("PODCAST_RETENTION_MONTHS", "0"))
+        except ValueError:
+            parser.error("PODCAST_RETENTION_MONTHS must be an integer between 0 and 120")
+    if not 0 <= months <= 120:
+        parser.error("Episode retention must be between 0 and 120 months")
+    lib = Library(data, args.poll_minutes, months)
     access = Access(data, args.gateway_port, os.environ.get("PODCAST_PUBLIC_URL", ""))
     with WebServer(args.port, lib, access, True, args.port) as local, WebServer(args.gateway_port, lib, access, False, args.port) as gateway:
         stopped = threading.Event()

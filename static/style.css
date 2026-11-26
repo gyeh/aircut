@@ -780,6 +780,20 @@ main:focus {
   margin-top: 5px;
 }
 
+.briefing h2:not(:first-child) {
+  margin-top: 1.8rem;
+}
+
+.briefing h3 {
+  margin: 1.25rem 0 .4rem;
+}
+
+.briefing blockquote {
+  margin: 1.2rem 0 .5rem;
+  padding-left: 1rem;
+  border-left: 3px solid var(--orange);
+}
+
 .prose h3 {
   font: 600 17px/1.35 var(--sans);
 }
@@ -790,13 +804,16 @@ main:focus {
   line-height: 1.7;
 }
 
-.ad-row {
-  margin: 10px 0;
+.removed-ads p,.removed-ads ol {
+  margin-top: .75rem;
 }
 
-.ad-row b {
-  font: 600 12px var(--mono);
-  margin-right: 10px;
+.removed-ads ol {
+  padding-left: 1.5rem;
+}
+
+.removed-ads li + li {
+  margin-top: .75rem;
 }
 
 .setup-note {
@@ -1414,4 +1431,71 @@ dialog .button {
 
 .link-block label {
   margin-bottom: 4px;
+}
+
+.rss-directory {
+  margin-top: 24px;
+}
+
+.stats-totals {
+  display: grid;
+  grid-template-columns: 2fr 1fr 1fr;
+  margin: 0 0 36px;
+  padding: 22px 0;
+  border-block: 1px solid var(--line);
+}
+.stats-totals dt,.stats-ranking > p {
+  color: var(--muted);
+  font-size: 14px;
+}
+.stats-totals dd {
+  margin: 4px 0 0;
+  font: 36px/1.2 var(--serif);
+  font-variant-numeric: tabular-nums;
+}
+.stats-totals div:first-child dd { color: var(--rust); }
+.stats-rankings {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
+  gap: 40px;
+}
+.stats-ranking h2 { font: 30px/1.2 var(--serif); }
+.stats-ranking > p { margin: 8px 0 18px; }
+.stats-ranking table { width: 100%; border-collapse: collapse; font-size: 14px; }
+.stats-ranking th,.stats-ranking td {
+  padding: 9px 4px;
+  border-bottom: 1px solid var(--line);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.stats-ranking th:first-child { text-align: left; padding-left: 0; overflow-wrap: anywhere; }
+.stats-ranking thead th { color: var(--muted); font-size: 12px; }
+.stats-ranking tbody th { font-weight: 500; }
+.stats-ranking:not(.expanded) tbody tr:nth-child(n+11) { display: none; }
+.stats-ranking .quiet { margin-top: 10px; }
+.stats-track { height: 3px; display: block; background: var(--line); margin-top: 3px; }
+.stats-track i { height: 100%; display: block; background: var(--rust); }
+
+@media (max-width: 800px) {
+  .stats-rankings { grid-template-columns: minmax(0, 1fr); }
+  nav { gap: 15px; }
+}
+@media (max-width: 600px) {
+  nav { justify-content: space-between; gap: 6px; overflow-x: auto; }
+  nav a { white-space: nowrap; }
+  .stats-totals { grid-template-columns: auto auto; gap: 16px; }
+  .stats-totals div:first-child { grid-column: 1 / -1; }
+  .stats-totals dd { font-size: 30px; }
+}
+
+.rss-directory .link-block {
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.rss-directory label {
+  display: block;
+  margin-bottom: 8px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
 }
